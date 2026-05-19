@@ -1,0 +1,102 @@
+# DS4 server — CUDA ARM64.
+#
+# Requires:
+#   - Host with NVIDIA ARM GPU (e.g. DGX Spark / GB10, Grace Hopper, Orin)
+#   - NVIDIA driver + nvidia-container-toolkit installed on the host
+#   - GGUF weights downloaded under ./gguf (use ./download_model.sh)
+#
+# Quick start:
+#   ./build.sh
+#   ./download_model.sh q2-imatrix       # weights -> ./gguf, symlinks ./ds4flash.gguf
+#   docker compose up -d
+#   docker compose logs -f
+#
+# OpenAI-compatible endpoint will be available at:
+#   http://<host>:30001/v1/chat/completions
+
+services:
+  ds4-server:
+    image: ds4:cuda-arm64
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/arm64
+      args:
+        # GB10 Blackwell. Override CUDA_ARCH for other ARM CUDA targets:
+        #   sm_90 -> Grace Hopper, sm_87 -> Orin / AGX.
+        CUDA_TARGET: cuda
+        CUDA_ARCH: sm_120
+    container_name: ds4-server
+    restart: unless-stopped
+
+    ports:
+      - "30001:30001"
+
+    volumes:
+      # GGUF weights — populated by ./download_model.sh on the host.
+      # Mount the whole gguf dir (read-only) so any *.gguf inside is visible
+      # at /models/<filename>.
+      - ./gguf:/models:ro
+      # Also expose the host's ds4flash.gguf symlink at the same path inside
+      # the container. The bind target is the resolved file, so it works even
+      # though the host path is a symlink.
+      - ./ds4flash.gguf:/app/ds4flash.gguf:ro
+      # Disk KV checkpoint store. Persisted across restarts.
+      - ./kv-cache:/kv
+      # Session traces (optional, useful for bug reports).
+      - ./traces:/traces
+
+    # GPU access (Compose v2 generic device syntax).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # IPC=host avoids the small /dev/shm default that can hurt CUDA pinned mem.
+    ipc: host
+
+    # Tune via environment so you don't have to rebuild for parameter changes.
+    environment:
+      DS4_MODEL: /models/ds4flash.gguf
+      DS4_CTX: "100000"
+      DS4_PORT: "30001"
+      DS4_KV_DIR: /kv
+      DS4_KV_MB: "16384"
+
+    command:
+      - ./ds4-server
+      # /app/ds4flash.gguf is bind-mounted from the host's ds4flash.gguf
+      # symlink (which download_model.sh maintains). To pin a specific quant
+      # instead, point this at /models/<exact-filename>.gguf.
+      - --model
+      - /app/ds4flash.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "30001"
+      - --ctx
+      - "100000"
+      - --kv-disk-dir
+      - /kv
+      - --kv-disk-space-mb
+      - "16384"
+      - --trace
+      - /traces/session.trace
+      # Uncomment to enable MTP speculative decoding (download first):
+      # - --mtp
+      # - /models/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
+      # - --mtp-draft
+      # - "2"
+      # Uncomment for browser clients:
+      # - --cors
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:30001/v1/models"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s

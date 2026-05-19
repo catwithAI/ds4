@@ -13,3 +13,9 @@
 /misc/
 .*.swp
 .DS_Store
+
+# Docker artifacts
+*.tar
+*.tar.gz
+/kv-cache/
+/traces/
