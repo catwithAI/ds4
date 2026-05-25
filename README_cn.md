@@ -164,89 +164,193 @@ make cpu              # 仅 CPU 诊断构建
 
 ## Docker 部署（ARM64 + CUDA）
 
-中文版独有章节。本仓库的 Docker 化方案目标是 **DGX Spark / GB10** 等 ARM64 + NVIDIA 平台。仓库根目录已包含：
+中文版独有章节。本仓库已经准备好一套针对 **DGX Spark / GB10** 等 ARM64 + NVIDIA 平台的容器化方案，从构建到访问 API 一条龙。仓库根目录的相关文件：
 
 | 文件 | 作用 |
 | --- | --- |
-| `Dockerfile` | 多阶段构建，`nvidia/cuda:*-devel` 编译 → `nvidia/cuda:*-runtime` 运行 |
-| `build.sh` | 封装 `docker buildx`，强制 `linux/arm64`，支持切换目标架构 |
-| `docker-compose.yaml` | 端口 30001、GPU 申请、KV 落盘 volume 一站式配置 |
-| `.dockerignore` | 排除权重、对象文件、git 等 |
+| `Dockerfile` | 多阶段构建：`nvidia/cuda:12.8.1-devel`（编译）→ `nvidia/cuda:12.8.1-runtime`（运行） |
+| `build.sh` | 封装 `docker buildx`，强制 `linux/arm64`，构建完自动 `docker save` 成 tar |
+| `docker-compose.yaml` | 端口 30001、GPU 申请、Volume 映射一站式配置 |
+| `.dockerignore` | 排除权重、tar、KV 缓存、git 等 |
 
-### 前提
+### 0. 前提
 
 - Host 是 ARM64 Linux + NVIDIA GPU（如 DGX Spark / GB10、Grace Hopper、Orin）
-- Host 装好 NVIDIA driver + **nvidia-container-toolkit**
-- Apple Silicon Mac 可以**构建**镜像，但**无法运行**（Docker Desktop for Mac 不透传 NVIDIA GPU）
+- Host 装好 NVIDIA driver（≥ 570，对应 CUDA 12.8）+ **nvidia-container-toolkit**
+- 已安装 Docker（含 `docker buildx` 和 `docker compose` v2）
+- Apple Silicon Mac 可以**构建**镜像（buildx + QEMU），但**无法运行**（Docker Desktop for Mac 不透传 NVIDIA GPU）
 
-### 构建
+检查 driver / CUDA 版本：
 
 ```sh
-./build.sh                  # 默认 cuda-spark (DGX Spark / GB10)
-./build.sh generic          # nvcc -arch=native (在目标机上构建)
+nvidia-smi | head -5
+# 应看到:  Driver Version: 570.xx 或更高,  CUDA Version: 12.8 或更高
+```
+
+### 1. 克隆仓库
+
+```sh
+git clone https://github.com/<your-fork>/ds4.git
+cd ds4
+```
+
+> 本仓库要求**模型权重位于宿主机的 `./gguf/` 目录**。下面的所有相对路径都从仓库根目录开始算。
+
+### 2. 准备模型权重
+
+权重 81 GB 起，**绝不会**打进镜像。下载到宿主机的 `./gguf/`：
+
+```sh
+# 96 / 128 GB 内存机器（推荐）
+./download_model.sh q2-imatrix
+
+# 256 GB 以上才考虑
+# ./download_model.sh q4-imatrix
+```
+
+下载完成后，仓库根目录会出现一个软链：
+
+```
+./ds4flash.gguf  ->  ./gguf/<MODEL_FILE>.gguf
+```
+
+后续所有命令里出现的 `<MODEL_FILE>` 都指**你下载到 `./gguf/` 里的具体 GGUF 文件名**（例如 `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf`）。Compose 默认走软链，**不需要**你手动改文件名；但 `docker run` 直接启动时建议用绝对文件名。
+
+### 3. 构建镜像
+
+```sh
+./build.sh                  # 默认 sm_120 (DGX Spark / GB10 Blackwell)
 ./build.sh sm_90            # Grace Hopper
 ./build.sh sm_87            # Orin / AGX
+./build.sh generic          # 在目标机上跑 nvcc -arch=native
 ```
+
+构建完成会做两件事：
+
+1. 本地 Docker 里生成 image `ds4:cuda-arm64`
+2. 在仓库根目录生成 `ds4-cuda-arm64.tar`（约 2~3 GB），方便离线拷贝到其它机器
 
 环境变量覆盖：
 
-| 变量 | 默认 |
-| --- | --- |
-| `IMAGE_NAME` | `ds4:cuda-arm64` |
-| `CUDA_IMAGE_TAG` | `12.6.3-devel-ubuntu22.04` |
-| `CUDA_RUNTIME_TAG` | `12.6.3-runtime-ubuntu22.04` |
-| `CPU_FLAG` | 空（镜像默认 `-mcpu=neoverse-v2`，对应 GB10 Grace 核） |
+| 变量 | 默认 | 用途 |
+| --- | --- | --- |
+| `IMAGE_NAME` | `ds4:cuda-arm64` | 镜像 tag |
+| `CUDA_IMAGE_TAG` | `12.8.1-devel-ubuntu22.04` | 编译用 base 镜像 |
+| `CUDA_RUNTIME_TAG` | `12.8.1-runtime-ubuntu22.04` | 运行用 base 镜像 |
+| `CPU_FLAG` | 空（镜像默认 `-mcpu=neoverse-v2`，对应 GB10 Grace 核） | -mcpu 值 |
+| `SAVE_TAR` | `1` | 设为 `0` 跳过 `docker save` |
+| `TAR_PATH` | `./<image>.tar` | tar 输出路径 |
 
-### 下载权重
+跨机部署：在另一台 ARM64 + NVIDIA 主机上 `docker load -i ds4-cuda-arm64.tar` 即可，无需重新构建。
 
-```sh
-./download_model.sh q2-imatrix
-# 权重会落到 ./gguf/，并把 ./ds4flash.gguf 软链到选中模型
-```
-
-### 启动
+### 4. 准备运行时目录
 
 ```sh
 mkdir -p kv-cache traces
+```
+
+| 宿主机目录 | 容器内 | 用途 |
+| --- | --- | --- |
+| `./gguf` | `/models`（只读） | 上一步下载的 GGUF 权重 |
+| `./ds4flash.gguf` | `/app/ds4flash.gguf`（只读） | 软链，指向你选中的权重 |
+| `./kv-cache` | `/kv` | 磁盘 KV checkpoint，跨重启持久化 |
+| `./traces` | `/traces` | 会话 trace，便于排错 |
+
+### 5. 启动服务（推荐用 Compose）
+
+```sh
 docker compose up -d
 docker compose logs -f
 ```
 
-服务监听 **30001 端口**，OpenAI 兼容入口：
+日志看到类似下面就说明加载成功（首次加载 81 GB 权重大约 30 秒 ~ 2 分钟）：
 
 ```
-http://<host>:30001/v1/chat/completions
+ds4-server: loading /app/ds4flash.gguf
+ds4-server: listening on 0.0.0.0:30001
 ```
 
-`docker-compose.yaml` 中默认的命令行等价于：
+`docker-compose.yaml` 里默认执行的命令等价于：
 
 ```sh
 ./ds4-server \
-  --model /models/ds4flash.gguf \
+  --model /app/ds4flash.gguf \
   --host 0.0.0.0 --port 30001 \
   --ctx 100000 \
   --kv-disk-dir /kv --kv-disk-space-mb 16384 \
   --trace /traces/session.trace
 ```
 
-Volume 映射：
+### 6. 验证服务
 
-| 宿主机 | 容器内 | 用途 |
-| --- | --- | --- |
-| `./gguf` | `/models`（只读） | GGUF 权重 |
-| `./kv-cache` | `/kv` | 磁盘 KV checkpoint，跨重启持久化 |
-| `./traces` | `/traces` | 会话 trace，方便排错 |
+服务监听 **30001 端口**，提供 OpenAI / Anthropic 兼容 API：
 
-### MTP / CORS / 自定义参数
+```sh
+# 列出模型
+curl http://localhost:30001/v1/models
 
-`docker-compose.yaml` 里把 MTP 和 `--cors` 注释掉了，按需取消注释即可。其它参数也可以直接改 `command` 里的列表，重启容器生效，不用重建镜像。
+# 跑一次对话
+curl http://localhost:30001/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "deepseek-v4-flash",
+    "messages": [{"role":"user","content":"你好"}],
+    "stream": false
+  }'
+```
 
-### 注意事项
+> 想从其它机器访问：把 `localhost` 换成宿主机 IP，并确认防火墙放开了 30001。
 
-1. `--host 0.0.0.0` **必填**，否则容器内只监听 127.0.0.1，宿主访问不到
-2. `--ctx` 决定启动时 KV 内存预算，启动日志会打印估算值。q2 + 128GB 机器，**100k~300k 上下文比较稳妥**
-3. **不要把权重打进镜像**（81–153GB），永远走 volume
-4. `./kv-cache` 务必落到容量充裕的盘上，长期会逼近 `--kv-disk-space-mb` 上限
+### 7. 不用 Compose？直接 docker run
+
+```sh
+docker run --rm --gpus all \
+  --ipc=host \
+  -p 30001:30001 \
+  -v "$PWD/gguf:/models:ro" \
+  -v "$PWD/kv-cache:/kv" \
+  -v "$PWD/traces:/traces" \
+  ds4:cuda-arm64 \
+  ./ds4-server \
+    --model /models/<MODEL_FILE>.gguf \
+    --host 0.0.0.0 --port 30001 \
+    --ctx 100000 \
+    --kv-disk-dir /kv --kv-disk-space-mb 16384
+```
+
+> 把 `<MODEL_FILE>.gguf` 替换为你 `./gguf/` 下的实际文件名。
+
+### 8. 换模型 / 调参数
+
+**换不同量化**（推荐用宿主软链法，不动 compose）：
+
+```sh
+./download_model.sh q4-imatrix    # 自动重链 ./ds4flash.gguf
+docker compose restart
+```
+
+或者在 `docker-compose.yaml` 的 `command` 段直接写死具体文件名：
+
+```yaml
+- --model
+- /models/<MODEL_FILE>.gguf
+```
+
+**MTP 推测解码 / CORS / 其它参数**：`docker-compose.yaml` 里相关行已经预置注释，按需取消注释或追加参数，**重启容器**生效（不用重新构建镜像）。
+
+```sh
+docker compose restart
+```
+
+### 常见坑
+
+1. **`--host 0.0.0.0` 必填**，否则容器内只监听 127.0.0.1，宿主访问不到（compose 已经配好）
+2. **driver 版本**：CUDA 12.8 runtime 要求 host driver ≥ 570。`nvidia-smi` 看一眼
+3. **`--ctx` 决定 KV 启动预算**，启动日志会打印估算值。q2 + 128 GB 机器，**100k~300k 上下文**比较稳妥；1M 满 ctx 单 indexer 就要 ~22 GB
+4. **不要把权重打进镜像**（81~153 GB），永远走 volume
+5. **`./kv-cache` 落在容量充裕的盘**，长期使用会逼近 `--kv-disk-space-mb` 上限；删整目录即清空缓存
+6. **首启很慢**：81 GB 权重需要从磁盘加载到 GPU，加 `--warm-weights` 会让首启更慢但首次推理更稳
+7. **buildx 警告 `FromPlatformFlagConstDisallowed`** 已经修掉；若仍报错，确认 Docker 是较新版本（≥ 24）
 
 ---
 
