@@ -13,6 +13,7 @@
 #   CUDA_IMAGE_TAG   devel base image tag  (default: 12.8.1-devel-ubuntu22.04)
 #   CUDA_RUNTIME_TAG runtime base tag      (default: 12.8.1-runtime-ubuntu22.04)
 #   CPU_FLAG         -mcpu value           (default: neoverse-v2 for GB10)
+#   SPARK_HBM_CACHE  GB10 HBM weight cache (default: 1; set 0 for non-GB10 ARM)
 #   PROGRESS         buildx --progress     (default: auto)
 #   SAVE_TAR         set to 0 to skip the docker-save step (default: 1)
 #   TAR_PATH         output tar path        (default: ./<image-without-colons>.tar
@@ -29,6 +30,10 @@ IMAGE_NAME="${IMAGE_NAME:-ds4:cuda-arm64}"
 CUDA_IMAGE_TAG="${CUDA_IMAGE_TAG:-12.8.1-devel-ubuntu22.04}"
 CUDA_RUNTIME_TAG="${CUDA_RUNTIME_TAG:-12.8.1-runtime-ubuntu22.04}"
 CPU_FLAG="${CPU_FLAG:-}"
+# Spark HBM weight cache (~+16% decode on GB10). Applies only to the plain
+# `cuda` target (sm_* / default). Set SPARK_HBM_CACHE=0 to disable for non-GB10
+# ARM targets like Grace Hopper / Orin where it offers no benefit.
+SPARK_HBM_CACHE="${SPARK_HBM_CACHE:-1}"
 PROGRESS="${PROGRESS:-auto}"
 SAVE_TAR="${SAVE_TAR:-1}"
 # Default tar path: ./<image-name-with-colon-replaced>.tar in the repo root.
@@ -69,6 +74,7 @@ build_args=(
     --build-arg "CUDA_IMAGE_TAG=$CUDA_IMAGE_TAG"
     --build-arg "CUDA_RUNTIME_TAG=$CUDA_RUNTIME_TAG"
     --build-arg "CUDA_TARGET=$CUDA_TARGET"
+    --build-arg "SPARK_HBM_CACHE=$SPARK_HBM_CACHE"
 )
 if [ -n "$CUDA_ARCH" ]; then
     build_args+=( --build-arg "CUDA_ARCH=$CUDA_ARCH" )
@@ -82,6 +88,9 @@ echo "  base devel:    $CUDA_IMAGE_TAG"
 echo "  base runtime:  $CUDA_RUNTIME_TAG"
 echo "  make target:   $CUDA_TARGET${CUDA_ARCH:+ (CUDA_ARCH=$CUDA_ARCH)}"
 echo "  CPU flag:      ${CPU_FLAG:-(image default: neoverse-v2)}"
+if [ "$CUDA_TARGET" = "cuda" ]; then
+    echo "  Spark HBM:     $([ "$SPARK_HBM_CACHE" = "1" ] && echo "enabled" || echo "disabled")"
+fi
 echo
 
 # Prefer buildx when available so the build runs in linux/arm64 even on
