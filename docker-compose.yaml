@@ -27,6 +27,8 @@ services:
         #   sm_90 -> Grace Hopper, sm_87 -> Orin / AGX.
         CUDA_TARGET: cuda
         CUDA_ARCH: sm_120
+        # GB10 HBM weight cache (~+16% decode). Set to 0 for non-GB10 ARM.
+        SPARK_HBM_CACHE: 1
     container_name: ds4-server
     restart: unless-stopped
 

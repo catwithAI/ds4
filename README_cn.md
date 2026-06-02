@@ -225,6 +225,14 @@ cd ds4
 ./build.sh generic          # 在目标机上跑 nvcc -arch=native
 ```
 
+默认（`sm_120` / `sm_90` / `sm_87` 等 `cuda` 目标）会**自动启用 DGX Spark HBM 权重缓存**，把注意力投影、MoE 共享专家、输出投影等热点张量在引擎启动时常驻显存（HBM），在 GB10 上实测解码约 **+16%**（~13.9 → ~16.1 t/s）。非 GB10 的 ARM 平台（Grace Hopper / Orin）该缓存无收益，可设 `SPARK_HBM_CACHE=0` 关掉：
+
+```sh
+SPARK_HBM_CACHE=0 ./build.sh sm_90    # Grace Hopper，不启用 HBM 缓存
+```
+
+> 说明：`./build.sh spark`（`cuda-spark` 目标）本身就带 HBM 缓存，但它会丢掉 `-arch`，只适合**在 GB10 主机上直接 `make`**；在 Docker 镜像里编译会因 nvcc 默认 `sm_52` 失败。所以容器路径保持 `make cuda CUDA_ARCH=sm_120` 并单独注入 HBM 缓存宏，同时拿到合法 arch 和加速。
+
 构建完成会做两件事：
 
 1. 本地 Docker 里生成 image `ds4:cuda-arm64`
@@ -238,6 +246,7 @@ cd ds4
 | `CUDA_IMAGE_TAG` | `12.8.1-devel-ubuntu22.04` | 编译用 base 镜像 |
 | `CUDA_RUNTIME_TAG` | `12.8.1-runtime-ubuntu22.04` | 运行用 base 镜像 |
 | `CPU_FLAG` | 空（镜像默认 `-mcpu=neoverse-v2`，对应 GB10 Grace 核） | -mcpu 值 |
+| `SPARK_HBM_CACHE` | `1` | DGX Spark / GB10 HBM 权重缓存（~+16% 解码）；非 GB10 ARM 设 `0` |
 | `SAVE_TAR` | `1` | 设为 `0` 跳过 `docker save` |
 | `TAR_PATH` | `./<image>.tar` | tar 输出路径 |
 

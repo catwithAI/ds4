@@ -35,6 +35,14 @@ FROM --platform=$BUILDPLATFORM nvidia/cuda:${CUDA_IMAGE_TAG} AS build
 ARG CUDA_TARGET=cuda
 ARG CUDA_ARCH=sm_120
 
+# Spark HBM weight cache. The Makefile only enables DS4_CUDA_SPARK_HBM_CACHE on
+# the `cuda-spark` target, but that target drops -arch (which fails to build in
+# this image, see above). So when building for GB10 we keep `make cuda
+# CUDA_ARCH=sm_120` AND inject the macro by hand, getting both a valid arch and
+# the ~+16% HBM-resident decode speedup. Set to 0 for non-GB10 ARM targets
+# (Grace Hopper / Orin), where the cache offers no benefit.
+ARG SPARK_HBM_CACHE=1
+
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -50,11 +58,20 @@ COPY . /src
 # pinned to the build host's exact CPU revision.
 ENV NATIVE_CPU_FLAG=-mcpu=neoverse-v2
 
+# When SPARK_HBM_CACHE=1 we enable the HBM weight cache on the plain `cuda`
+# target by appending the macro via the Makefile's EXTRA_CUDA_FLAGS hook (which
+# uses += so the default flag sets are preserved). The `cuda-spark` /
+# cuda-generic targets manage the macro themselves, so we only inject it for
+# the plain `cuda` target.
 RUN if [ "$CUDA_TARGET" = "cuda" ] && [ -z "$CUDA_ARCH" ]; then \
         echo "CUDA_TARGET=cuda requires --build-arg CUDA_ARCH=sm_XX" >&2; exit 2; \
     fi && \
+    EXTRA=""; \
+    if [ "$CUDA_TARGET" = "cuda" ] && [ "$SPARK_HBM_CACHE" = "1" ]; then \
+        EXTRA="EXTRA_CUDA_FLAGS=-DDS4_CUDA_SPARK_HBM_CACHE=1"; \
+    fi && \
     if [ -n "$CUDA_ARCH" ]; then \
-        make $CUDA_TARGET CUDA_ARCH=$CUDA_ARCH; \
+        make $CUDA_TARGET CUDA_ARCH=$CUDA_ARCH $EXTRA; \
     else \
         make $CUDA_TARGET; \
     fi
@@ -73,6 +90,7 @@ COPY --from=build /src/ds4         /app/ds4
 COPY --from=build /src/ds4-server  /app/ds4-server
 COPY --from=build /src/ds4-bench   /app/ds4-bench
 COPY --from=build /src/ds4-eval    /app/ds4-eval
+COPY --from=build /src/ds4-agent   /app/ds4-agent
 COPY --from=build /src/download_model.sh /app/download_model.sh
 
 ENV PATH=/app:$PATH

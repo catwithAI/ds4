@@ -27,6 +27,12 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+# Extra flags appended (not overriding) to both C and nvcc flags. Lets callers
+# inject macros like -DDS4_CUDA_SPARK_HBM_CACHE=1 onto the plain `cuda` target
+# without restating the full flag sets (used by the Docker GB10 build).
+EXTRA_CUDA_FLAGS ?=
+CFLAGS += $(EXTRA_CUDA_FLAGS)
+NVCCFLAGS += $(EXTRA_CUDA_FLAGS)
 CORE_OBJS = ds4.o ds4_distributed.o ds4_cuda.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
