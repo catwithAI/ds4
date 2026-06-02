@@ -134,6 +134,7 @@ static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
 static uint64_t g_model_mapped_size;
+static uint64_t g_model_mapped_max_tensor_bytes;
 static uint64_t g_tensor_alloc_live_bytes;
 static uint64_t g_tensor_alloc_peak_bytes;
 static uint64_t g_model_wrap_count;
@@ -194,8 +195,10 @@ static void ds4_gpu_print_device_summary(void) {
     }
 }
 
-#define DS4_METAL_MAX_MODEL_VIEWS 16
-#define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
+#define DS4_METAL_MAX_MODEL_VIEWS 4096
+/* Compatibility fallback for callers that cannot provide a parsed GGUF tensor
+ * span. The normal DS4 engine passes the exact maximum tensor byte size. */
+#define DS4_METAL_FALLBACK_MAX_TENSOR_BYTES (4ull * 1024ull * 1024ull * 1024ull)
 
 typedef struct {
     __strong id<MTLBuffer> buffer;
@@ -356,8 +359,15 @@ static uint64_t round_up_u64(uint64_t v, uint64_t align) {
     return (v + align - 1) & ~(align - 1);
 }
 
+static uint64_t ds4_gpu_effective_model_max_tensor_bytes(uint64_t map_size, uint64_t max_tensor_bytes) {
+    if (max_tensor_bytes != 0) return max_tensor_bytes;
+    return map_size < DS4_METAL_FALLBACK_MAX_TENSOR_BYTES ?
+           map_size : DS4_METAL_FALLBACK_MAX_TENSOR_BYTES;
+}
+
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
 static int ds4_gpu_warm_model_views(void);
+static double ds4_gpu_gib(uint64_t bytes);
 
 static double ds4_gpu_now_ms(void) {
     struct timespec ts;
@@ -448,12 +458,13 @@ static int ds4_gpu_model_residency_request_views(void) {
     return 1;
 }
 
-static int ds4_gpu_map_model_views(
+static int ds4_gpu_add_model_view_range(
         const void *model_map,
         uint64_t    model_size,
         uint64_t    map_offset,
-        uint64_t    map_size) {
-    const double t0 = ds4_gpu_now_ms();
+        uint64_t    map_size,
+        uint64_t    max_tensor_bytes,
+        uint64_t   *mapped_model_size_out) {
     const uint64_t page = (uint64_t)getpagesize();
     const uintptr_t model_addr = (uintptr_t)model_map;
 
@@ -465,9 +476,14 @@ static int ds4_gpu_map_model_views(
         fprintf(stderr, "ds4: Metal model mapped range is outside the GGUF mapping\n");
         return 0;
     }
-
     const uint64_t page_model_offset = map_offset & ~(page - 1);
     const uint64_t leading = map_offset - page_model_offset;
+    if (map_size > UINT64_MAX - leading ||
+        leading + map_size > UINT64_MAX - (page - 1))
+    {
+        fprintf(stderr, "ds4: Metal model mapped range overflows page alignment\n");
+        return 0;
+    }
     const uint64_t mapped_model_size = round_up_u64(leading + map_size, page);
     uint64_t max_buffer = (uint64_t)[g_device maxBufferLength];
     max_buffer &= ~(page - 1);
@@ -488,9 +504,26 @@ static int ds4_gpu_map_model_views(
      * inside at least one view, so hot paths pass one buffer and one inner byte
      * offset. We never split a weight tensor across command encoders.
      */
-    const uint64_t overlap = round_up_u64(DS4_METAL_MODEL_MAX_TENSOR_BYTES, page) + page;
+    if (max_tensor_bytes > map_size) {
+        fprintf(stderr, "ds4: Metal model max tensor span is larger than a mapped tensor span\n");
+        return 0;
+    }
+    if (max_tensor_bytes > UINT64_MAX - (page - 1)) {
+        fprintf(stderr, "ds4: Metal model max tensor span overflows page alignment\n");
+        return 0;
+    }
+    const uint64_t max_tensor_rounded = round_up_u64(max_tensor_bytes, page);
+    if (max_tensor_rounded > UINT64_MAX - page) {
+        fprintf(stderr, "ds4: Metal model view overlap overflows page slack\n");
+        return 0;
+    }
+    const uint64_t overlap = max_tensor_rounded + page;
     if (max_buffer == 0 || max_buffer <= overlap) {
-        fprintf(stderr, "ds4: Metal maxBufferLength is too small for DS4 model views\n");
+        fprintf(stderr,
+                "ds4: Metal maxBufferLength is too small for DS4 model views "
+                "(max tensor %.2f GiB, max buffer %.2f GiB)\n",
+                ds4_gpu_gib(max_tensor_bytes),
+                ds4_gpu_gib(max_buffer));
         return 0;
     }
 
@@ -512,7 +545,7 @@ static int ds4_gpu_map_model_views(
         if (!buffer) {
             fprintf(stderr,
                     "ds4: Metal could not wrap mmaped model view at %.2f GiB, size %.2f GiB\n",
-                    (double)off / (1024.0 * 1024.0 * 1024.0),
+                    (double)(page_model_offset + off) / (1024.0 * 1024.0 * 1024.0),
                     (double)view_bytes / (1024.0 * 1024.0 * 1024.0));
             return 0;
         }
@@ -533,6 +566,14 @@ static int ds4_gpu_map_model_views(
         off += step;
     }
 
+    if (mapped_model_size_out) *mapped_model_size_out += mapped_model_size;
+    return 1;
+}
+
+static int ds4_gpu_finish_model_views(
+        double t0,
+        uint64_t mapped_model_size,
+        uint64_t display_offset) {
     const double t_mapped = ds4_gpu_now_ms();
     const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
     if (request_residency) ds4_gpu_progress_begin("requesting Metal residency (may take tens of seconds)");
@@ -568,9 +609,28 @@ static int ds4_gpu_map_model_views(
             t_resident - t_mapped,
             t_warm - t_warm0,
             mapped_model_size / 1024.0 / 1024.0,
-            page_model_offset / 1024.0 / 1024.0);
+            display_offset / 1024.0 / 1024.0);
     if (!warmed) return 0;
     return 1;
+}
+
+static int ds4_gpu_map_model_views(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    map_offset,
+        uint64_t    map_size,
+        uint64_t    max_tensor_bytes) {
+    const double t0 = ds4_gpu_now_ms();
+    uint64_t mapped_model_size = 0;
+    if (!ds4_gpu_add_model_view_range(model_map,
+                                      model_size,
+                                      map_offset,
+                                      map_size,
+                                      max_tensor_bytes,
+                                      &mapped_model_size)) {
+        return 0;
+    }
+    return ds4_gpu_finish_model_views(t0, mapped_model_size, map_offset);
 }
 
 static id<MTLBuffer> ds4_gpu_new_transient_buffer(NSUInteger bytes, const char *label) {
@@ -4518,6 +4578,7 @@ void ds4_gpu_cleanup(void) {
         g_model_map_size = 0;
         g_model_mapped_offset = 0;
         g_model_mapped_size = 0;
+        g_model_mapped_max_tensor_bytes = 0;
         g_tensor_alloc_live_bytes = 0;
         g_tensor_alloc_peak_bytes = 0;
         g_flash_attn_mask_bytes = 0;
@@ -4830,12 +4891,21 @@ int ds4_gpu_embed_tokens_hc_tensor(
     return 1;
 }
 
-int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!model_map || model_size == 0) return 0;
     if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) return 0;
+    max_tensor_bytes = ds4_gpu_effective_model_max_tensor_bytes(map_size, max_tensor_bytes);
 
     @autoreleasepool {
+        if (g_model_map_ptr == model_map &&
+            g_model_map_size == model_size &&
+            g_model_mapped_offset == map_offset &&
+            g_model_mapped_size == map_size &&
+            g_model_mapped_max_tensor_bytes == max_tensor_bytes) {
+            return 1;
+        }
+
         for (uint32_t i = 0; i < g_model_view_count; i++) {
             if (g_model_views[i].model_map == model_map &&
                 g_model_views[i].model_size == model_size &&
@@ -4846,14 +4916,15 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
         }
 
         ds4_gpu_model_residency_clear();
+        if (!ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size, max_tensor_bytes)) {
+            ds4_gpu_model_residency_clear();
+            return 0;
+        }
         g_model_map_ptr = model_map;
         g_model_map_size = model_size;
         g_model_mapped_offset = map_offset;
         g_model_mapped_size = map_size;
-        if (!ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size)) {
-            ds4_gpu_model_residency_clear();
-            return 0;
-        }
+        g_model_mapped_max_tensor_bytes = max_tensor_bytes;
         fprintf(stderr,
                 "ds4: Metal mapped mmaped model as %u overlapping shared buffers\n",
                 g_model_view_count);
@@ -4861,8 +4932,73 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
     }
 }
 
+int ds4_gpu_set_model_map_spans(
+        const void *model_map,
+        uint64_t model_size,
+        const uint64_t *offsets,
+        const uint64_t *sizes,
+        uint32_t count,
+        uint64_t max_tensor_bytes) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || model_size == 0 || !offsets || !sizes || count == 0) return 0;
+    if (count == 1) {
+        return ds4_gpu_set_model_map_range(model_map,
+                                           model_size,
+                                           offsets[0],
+                                           sizes[0],
+                                           max_tensor_bytes);
+    }
+
+    @autoreleasepool {
+        const double t0 = ds4_gpu_now_ms();
+        max_tensor_bytes = ds4_gpu_effective_model_max_tensor_bytes(model_size, max_tensor_bytes);
+
+        ds4_gpu_model_residency_clear();
+        ds4_gpu_model_views_clear();
+
+        uint64_t mapped_total = 0;
+        uint64_t first_offset = UINT64_MAX;
+        for (uint32_t i = 0; i < count; i++) {
+            if (offsets[i] > model_size || sizes[i] == 0 || sizes[i] > model_size - offsets[i]) {
+                fprintf(stderr, "ds4: Metal model span %u is outside the GGUF mapping\n", i);
+                ds4_gpu_model_residency_clear();
+                ds4_gpu_model_views_clear();
+                return 0;
+            }
+            if (offsets[i] < first_offset) first_offset = offsets[i];
+            uint64_t effective_max = max_tensor_bytes;
+            if (effective_max > sizes[i]) effective_max = sizes[i];
+            if (!ds4_gpu_add_model_view_range(model_map,
+                                              model_size,
+                                              offsets[i],
+                                              sizes[i],
+                                              effective_max,
+                                              &mapped_total)) {
+                ds4_gpu_model_residency_clear();
+                ds4_gpu_model_views_clear();
+                return 0;
+            }
+        }
+        if (!ds4_gpu_finish_model_views(t0, mapped_total, first_offset)) {
+            ds4_gpu_model_residency_clear();
+            ds4_gpu_model_views_clear();
+            return 0;
+        }
+        g_model_map_ptr = model_map;
+        g_model_map_size = model_size;
+        g_model_mapped_offset = first_offset == UINT64_MAX ? 0 : first_offset;
+        g_model_mapped_size = mapped_total;
+        g_model_mapped_max_tensor_bytes = max_tensor_bytes;
+        fprintf(stderr,
+                "ds4: Metal mapped mmaped model as %u disjoint shared buffers across %u tensor spans\n",
+                g_model_view_count,
+                count);
+        return 1;
+    }
+}
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
-    return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size);
+    return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);
 }
 
 int ds4_gpu_set_model_fd(int fd) {
@@ -5336,6 +5472,20 @@ int ds4_gpu_indexer_topk_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_argmax_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab) {
+    if (!out_idx || !logits || n_vocab == 0) return 0;
+    if (ds4_gpu_tensor_bytes(out_idx) < sizeof(int32_t) ||
+        ds4_gpu_tensor_bytes(logits) < (uint64_t)n_vocab * sizeof(float)) {
+        fprintf(stderr, "ds4: Metal graph argmax received undersized buffers\n");
+        return 0;
+    }
+
+    return ds4_gpu_indexer_topk_tensor(out_idx, logits, n_vocab, 1, 1);
 }
 
 int ds4_gpu_dsv4_topk_mask_tensor(
@@ -13216,15 +13366,16 @@ static int ds4_gpu_encode_get_rows_i32_token_rows(
         id<MTLBuffer>        selected,
         NSUInteger           selected_off,
         uint32_t             hash_rows,
+        uint32_t             n_cols,
         uint32_t             n_tokens) {
-    if (!cb || !table || !selected || hash_rows == 0 || n_tokens == 0) return 0;
+    if (!cb || !table || !selected || hash_rows == 0 || n_cols == 0 || n_tokens == 0) return 0;
     if (!tokens && !token_inline) return 0;
 
-    const uint64_t table_row_bytes = 6u * sizeof(int32_t);
+    const uint64_t table_row_bytes = (uint64_t)n_cols * sizeof(int32_t);
     const uint64_t token_bytes = (uint64_t)n_tokens * sizeof(int32_t);
     ds4_gpu_get_rows_args args = {
-        .ne00t = 6,
-        .ne00 = 6,
+        .ne00t = (int64_t)n_cols,
+        .ne00 = (int64_t)n_cols,
         .nb01 = table_row_bytes,
         .nb02 = (uint64_t)hash_rows * table_row_bytes,
         .nb03 = (uint64_t)hash_rows * table_row_bytes,
@@ -13237,11 +13388,11 @@ static int ds4_gpu_encode_get_rows_i32_token_rows(
         .nb3 = (uint64_t)n_tokens * table_row_bytes,
     };
 
-    NSUInteger nth = 6u;
+    NSUInteger nth = (NSUInteger)n_cols;
     const NSUInteger max_threads = g_get_rows_i32_pipeline.maxTotalThreadsPerThreadgroup;
     if (nth > max_threads) nth = max_threads;
     if (nth == 0) nth = 1u;
-    const NSUInteger nw0 = (6u + nth - 1u) / nth;
+    const NSUInteger nw0 = ((NSUInteger)n_cols + nth - 1u) / nth;
 
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     [enc setComputePipelineState:g_get_rows_i32_pipeline];
@@ -13267,19 +13418,21 @@ static int ds4_gpu_encode_get_rows_f32_router_weights(
         NSUInteger           selected_off,
         id<MTLBuffer>        weights,
         NSUInteger           weights_off,
+        uint32_t             n_expert,
+        uint32_t             n_expert_used,
         uint32_t             n_tokens) {
-    if (!cb || !probs || !selected || !weights || n_tokens == 0) return 0;
+    if (!cb || !probs || !selected || !weights || n_expert == 0 || n_expert_used == 0 || n_tokens == 0) return 0;
 
-    const uint64_t probs_token_bytes = 256u * sizeof(float);
-    const uint64_t selected_row_bytes = 6u * sizeof(int32_t);
-    const uint64_t weights_row_bytes = 6u * sizeof(float);
+    const uint64_t probs_token_bytes = (uint64_t)n_expert * sizeof(float);
+    const uint64_t selected_row_bytes = (uint64_t)n_expert_used * sizeof(int32_t);
+    const uint64_t weights_row_bytes = (uint64_t)n_expert_used * sizeof(float);
     ds4_gpu_get_rows_args args = {
         .ne00t = 1,
         .ne00 = 1,
         .nb01 = sizeof(float),
         .nb02 = probs_token_bytes,
         .nb03 = (uint64_t)n_tokens * probs_token_bytes,
-        .ne10 = 6,
+        .ne10 = (int64_t)n_expert_used,
         .nb10 = sizeof(int32_t),
         .nb11 = selected_row_bytes,
         .nb12 = (uint64_t)n_tokens * selected_row_bytes,
@@ -13294,7 +13447,7 @@ static int ds4_gpu_encode_get_rows_f32_router_weights(
     [enc setBuffer:probs offset:probs_off atIndex:1];
     [enc setBuffer:selected offset:selected_off atIndex:2];
     [enc setBuffer:weights offset:weights_off atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(6u, n_tokens, 1)
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_expert_used, n_tokens, 1)
          threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -13365,6 +13518,9 @@ static int ds4_gpu_encode_router_select(
         const int32_t        *single_token,
         uint32_t              hash_rows,
         uint32_t              n_tokens,
+        uint32_t              n_expert,
+        uint32_t              n_expert_used,
+        float                 expert_weight_scale,
         bool                  has_bias,
         bool                  hash_mode) {
     id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
@@ -13374,12 +13530,18 @@ static int ds4_gpu_encode_router_select(
     const NSUInteger weights_off = ds4_gpu_tensor_offset(weights);
     const NSUInteger probs_off = ds4_gpu_tensor_offset(probs);
 
-    if (!cb || !selectedbuf || !weightsbuf || !probsbuf || !logitsbuf || n_tokens == 0) return 0;
+    if (!cb || !selectedbuf || !weightsbuf || !probsbuf || !logitsbuf ||
+        n_tokens == 0 || n_expert == 0 || n_expert_used == 0) return 0;
 
-    const NSUInteger probs_bytes = (NSUInteger)n_tokens * 256u * sizeof(float);
+    const NSUInteger probs_bytes = (NSUInteger)n_tokens * (NSUInteger)n_expert * sizeof(float);
+    const bool flash_router_fast_path =
+        n_expert == 256u &&
+        n_expert_used == 6u &&
+        fabsf(expert_weight_scale - 1.5f) <= 1.0e-6f;
 
     int ok = 0;
-    if (!g_quality_mode && n_tokens == 1 &&
+    if (flash_router_fast_path &&
+        !g_quality_mode && n_tokens == 1 &&
         getenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSION") == NULL) {
         id<MTLComputePipelineState> softplus_sqrt_pipeline =
             ds4_gpu_hot_pipeline(g_dsv4_softplus_sqrt_pipeline,
@@ -13398,7 +13560,7 @@ static int ds4_gpu_encode_router_select(
                                              logits_off,
                                              probsbuf,
                                              probs_off,
-                                             256,
+                                             n_expert,
                                              1,
                                              1,
                                              0.0f,
@@ -13466,7 +13628,7 @@ static int ds4_gpu_encode_router_select(
         return 0;
     }
 
-    if (!g_quality_mode && n_tokens == 1) {
+    if (flash_router_fast_path && !g_quality_mode && n_tokens == 1) {
         id<MTLComputePipelineState> softplus_sqrt_pipeline =
             ds4_gpu_hot_pipeline(g_dsv4_softplus_sqrt_pipeline,
                                     "kernel_dsv4_softplus_sqrt_f32_4");
@@ -13477,7 +13639,7 @@ static int ds4_gpu_encode_router_select(
                                              logits_off,
                                              probsbuf,
                                              probs_off,
-                                             256,
+                                             n_expert,
                                              1,
                                              1,
                                              0.0f,
@@ -13489,7 +13651,7 @@ static int ds4_gpu_encode_router_select(
                                              logits_off,
                                              probsbuf,
                                              probs_off,
-                                             256,
+                                             n_expert,
                                              n_tokens,
                                              1,
                                              0.0f,
@@ -13500,7 +13662,7 @@ static int ds4_gpu_encode_router_select(
                                              probs_off,
                                              probsbuf,
                                              probs_off,
-                                             256,
+                                             n_expert,
                                              n_tokens,
                                              1,
                                              0.0f,
@@ -13518,6 +13680,7 @@ static int ds4_gpu_encode_router_select(
                                                       selectedbuf,
                                                       selected_off,
                                                       hash_rows,
+                                                      n_expert_used,
                                                       n_tokens);
     } else {
         ds4_gpu_tensor *score_tensor = probs;
@@ -13532,7 +13695,7 @@ static int ds4_gpu_encode_router_select(
                 return 0;
             }
 
-            ds4_gpu_bin_args add_args = ds4_gpu_make_bin_rows_args(256, n_tokens, 256);
+            ds4_gpu_bin_args add_args = ds4_gpu_make_bin_rows_args(n_expert, n_tokens, n_expert);
             ok = ds4_gpu_encode_bin_f32_rows(cb,
                                                g_add_pipeline,
                                                &add_args,
@@ -13552,11 +13715,11 @@ static int ds4_gpu_encode_router_select(
             score_tensor = (__bridge ds4_gpu_tensor *)selection_view;
         }
 
-        ok = ds4_gpu_indexer_topk_tensor(selected, score_tensor, 256, n_tokens, 6) != 0;
+        ok = ds4_gpu_indexer_topk_tensor(selected, score_tensor, n_expert, n_tokens, n_expert_used) != 0;
     }
     if (!ok) return 0;
 
-    if (!g_quality_mode && n_tokens == 1) {
+    if (flash_router_fast_path && !g_quality_mode && n_tokens == 1) {
         id<MTLComputePipelineState> router_weights_pipeline =
             ds4_gpu_hot_pipeline(g_dsv4_router_weights_one_pipeline,
                                     "kernel_dsv4_router_weights_one");
@@ -13579,13 +13742,15 @@ static int ds4_gpu_encode_router_select(
                                                       selected_off,
                                                       weightsbuf,
                                                       weights_off,
+                                                      n_expert,
+                                                      n_expert_used,
                                                       n_tokens) &&
          ds4_gpu_encode_sum_rows_f32(cb,
                                        weightsbuf,
                                        weights_off,
                                        g_router_weight_sum_buffer,
                                        0,
-                                       6,
+                                       n_expert_used,
                                        n_tokens) &&
          ds4_gpu_encode_unary_f32_rows(cb,
                                          g_unary_clamp_pipeline,
@@ -13600,9 +13765,9 @@ static int ds4_gpu_encode_router_select(
                                          ds4_gpu_positive_infinity());
     if (!ok) return 0;
 
-    ds4_gpu_bin_args div_args = ds4_gpu_make_bin_rowwise_scalar_args(6, n_tokens);
-    const float scale = 1.5f;
-    ds4_gpu_bin_args scale_args = ds4_gpu_make_bin_rows_args(6, n_tokens, 1);
+    ds4_gpu_bin_args div_args = ds4_gpu_make_bin_rowwise_scalar_args(n_expert_used, n_tokens);
+    const float scale = expert_weight_scale;
+    ds4_gpu_bin_args scale_args = ds4_gpu_make_bin_rows_args(n_expert_used, n_tokens, 1);
 
     ok = ds4_gpu_encode_bin_f32_rows(cb,
                                        g_bin_div_row_pipeline,
@@ -13624,7 +13789,7 @@ static int ds4_gpu_encode_router_select(
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)scale_args.ne1,
                                           (NSUInteger)scale_args.ne2,
                                           (NSUInteger)scale_args.ne3)
-         threadsPerThreadgroup:MTLSizeMake(ds4_gpu_bin_threads(6, g_bin_mul_scalar_pipeline), 1, 1)];
+         threadsPerThreadgroup:MTLSizeMake(ds4_gpu_bin_threads(n_expert_used, g_bin_mul_scalar_pipeline), 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
     return 1;
@@ -13640,16 +13805,20 @@ int ds4_gpu_router_select_tensor(
         uint64_t                hash_offset,
         uint32_t                hash_rows,
         uint32_t                token,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
         uint32_t                n_expert_groups,
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
         const ds4_gpu_tensor *logits) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!selected || !weights || !probs || !logits || !model_map) return 0;
+    if (!selected || !weights || !probs || !logits || !model_map ||
+        n_expert == 0 || n_expert_used == 0) return 0;
     if (hash_mode && token >= hash_rows) return 0;
     if (n_expert_groups > 1u || n_group_used > 0u) {
-        fprintf(stderr, "ds4: Metal router group gating is not part of this DeepSeek V4 Flash path\n");
+        fprintf(stderr, "ds4: Metal router group gating is not part of this DeepSeek V4 path\n");
         return 0;
     }
 
@@ -13659,10 +13828,10 @@ int ds4_gpu_router_select_tensor(
         id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
         id<MTLBuffer> probsbuf = ds4_gpu_tensor_buffer(probs);
         if (!logitsbuf || !selectedbuf || !weightsbuf || !probsbuf ||
-            ds4_gpu_tensor_bytes(logits) < 256u * sizeof(float) ||
-            ds4_gpu_tensor_bytes(selected) < 6u * sizeof(int) ||
-            ds4_gpu_tensor_bytes(weights) < 6u * sizeof(float) ||
-            ds4_gpu_tensor_bytes(probs) < 256u * sizeof(float)) {
+            ds4_gpu_tensor_bytes(logits) < (uint64_t)n_expert * sizeof(float) ||
+            ds4_gpu_tensor_bytes(selected) < (uint64_t)n_expert_used * sizeof(int) ||
+            ds4_gpu_tensor_bytes(weights) < (uint64_t)n_expert_used * sizeof(float) ||
+            ds4_gpu_tensor_bytes(probs) < (uint64_t)n_expert * sizeof(float)) {
             fprintf(stderr, "ds4: Metal router select received undersized buffers\n");
             return 0;
         }
@@ -13674,13 +13843,13 @@ int ds4_gpu_router_select_tensor(
         NSUInteger bias_set_offset = 0;
         NSUInteger hash_set_offset = 0;
         if (has_bias && !hash_mode) {
-            const uint64_t bias_bytes = 256u * sizeof(float);
+            const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
             biasbuf = ds4_gpu_wrap_model_range(model_map, model_size, bias_offset, bias_bytes, &bias_inner);
             if (!biasbuf) return 0;
             bias_set_offset = (NSUInteger)bias_inner;
         }
         if (hash_mode) {
-            const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
+            const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
             hashbuf = ds4_gpu_wrap_model_range(model_map, model_size, hash_offset, hash_bytes, &hash_inner);
             if (!hashbuf) return 0;
             hash_set_offset = (NSUInteger)hash_inner;
@@ -13707,6 +13876,9 @@ int ds4_gpu_router_select_tensor(
                                                       &token_i32,
                                                       hash_rows,
                                                       1,
+                                                      n_expert,
+                                                      n_expert_used,
+                                                      expert_weight_scale,
                                                       has_bias && !hash_mode,
                                                       hash_mode);
         if (!had_batch) {
@@ -13733,11 +13905,15 @@ int ds4_gpu_router_select_batch_tensor(
         bool                    hash_mode,
         const ds4_gpu_tensor *logits,
         const ds4_gpu_tensor *tokens,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
         uint32_t                n_tokens) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0) return 0;
+    if (!selected || !weights || !probs || !logits || !tokens || !model_map ||
+        n_expert == 0 || n_expert_used == 0 || n_tokens == 0) return 0;
     if (n_expert_groups > 1u || n_group_used > 0u) {
-        fprintf(stderr, "ds4: Metal router group gating is not part of this DeepSeek V4 Flash path\n");
+        fprintf(stderr, "ds4: Metal router group gating is not part of this DeepSeek V4 path\n");
         return 0;
     }
 
@@ -13748,10 +13924,10 @@ int ds4_gpu_router_select_batch_tensor(
         id<MTLBuffer> probsbuf = ds4_gpu_tensor_buffer(probs);
         id<MTLBuffer> tokensbuf = ds4_gpu_tensor_buffer(tokens);
         if (!logitsbuf || !selectedbuf || !weightsbuf || !probsbuf || !tokensbuf ||
-            ds4_gpu_tensor_bytes(logits) < (uint64_t)n_tokens * 256u * sizeof(float) ||
-            ds4_gpu_tensor_bytes(selected) < (uint64_t)n_tokens * 6u * sizeof(int) ||
-            ds4_gpu_tensor_bytes(weights) < (uint64_t)n_tokens * 6u * sizeof(float) ||
-            ds4_gpu_tensor_bytes(probs) < (uint64_t)n_tokens * 256u * sizeof(float) ||
+            ds4_gpu_tensor_bytes(logits) < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+            ds4_gpu_tensor_bytes(selected) < (uint64_t)n_tokens * n_expert_used * sizeof(int) ||
+            ds4_gpu_tensor_bytes(weights) < (uint64_t)n_tokens * n_expert_used * sizeof(float) ||
+            ds4_gpu_tensor_bytes(probs) < (uint64_t)n_tokens * n_expert * sizeof(float) ||
             ds4_gpu_tensor_bytes(tokens) < (uint64_t)n_tokens * sizeof(int32_t)) {
             fprintf(stderr, "ds4: Metal router batch select received undersized buffers\n");
             return 0;
@@ -13764,13 +13940,13 @@ int ds4_gpu_router_select_batch_tensor(
         NSUInteger bias_set_offset = 0;
         NSUInteger hash_set_offset = 0;
         if (has_bias && !hash_mode) {
-            const uint64_t bias_bytes = 256u * sizeof(float);
+            const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
             biasbuf = ds4_gpu_wrap_model_range(model_map, model_size, bias_offset, bias_bytes, &bias_inner);
             if (!biasbuf) return 0;
             bias_set_offset = (NSUInteger)bias_inner;
         }
         if (hash_mode) {
-            const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
+            const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
             hashbuf = ds4_gpu_wrap_model_range(model_map, model_size, hash_offset, hash_bytes, &hash_inner);
             if (!hashbuf) return 0;
             hash_set_offset = (NSUInteger)hash_inner;
@@ -13796,6 +13972,9 @@ int ds4_gpu_router_select_batch_tensor(
                                                       NULL,
                                                       hash_rows,
                                                       n_tokens,
+                                                      n_expert,
+                                                      n_expert_used,
+                                                      expert_weight_scale,
                                                       has_bias && !hash_mode,
                                                       hash_mode);
         if (!had_batch) {
@@ -13829,12 +14008,13 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t                out_dim,
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
-        n_expert == 0 || n_expert > 6) {
+        n_total_expert == 0 || n_expert == 0 || n_expert > 6) {
         return 0;
     }
     if ((expert_in_dim % 256u) != 0 || (expert_mid_dim % 256u) != 0) return 0;
@@ -13869,8 +14049,8 @@ int ds4_gpu_routed_moe_one_tensor(
             return 0;
         }
 
-        const uint64_t gate_tensor_bytes = 256ull * gate_expert_bytes;
-        const uint64_t down_tensor_bytes = 256ull * down_expert_bytes;
+        const uint64_t gate_tensor_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
+        const uint64_t down_tensor_bytes = (uint64_t)n_total_expert * down_expert_bytes;
         uint64_t gate_inner = 0;
         uint64_t up_inner = 0;
         uint64_t down_inner = 0;
@@ -13901,11 +14081,11 @@ int ds4_gpu_routed_moe_one_tensor(
         }
 
         ds4_gpu_mul_mv_id_args gate_args =
-            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, 256,
+            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
                                           gate_row_bytes, gate_expert_bytes,
                                           1, n_expert, n_tokens, gate_nr0);
         ds4_gpu_mul_mv_id_args down_args =
-            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, 256,
+            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
 
@@ -14135,6 +14315,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                out_dim,
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x,
@@ -14143,7 +14324,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         bool                   *mid_is_f16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
-        n_tokens == 0 || n_expert == 0 || n_expert > 6) {
+        n_tokens == 0 || n_total_expert == 0 || n_expert == 0 || n_expert > 6) {
         return 0;
     }
     if ((expert_in_dim % 256u) != 0 || (expert_mid_dim % 256u) != 0) return 0;
@@ -14180,8 +14361,8 @@ int ds4_gpu_routed_moe_batch_tensor(
             return 0;
         }
 
-        const uint64_t gate_tensor_bytes = 256ull * gate_expert_bytes;
-        const uint64_t down_tensor_bytes = 256ull * down_expert_bytes;
+        const uint64_t gate_tensor_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
+        const uint64_t down_tensor_bytes = (uint64_t)n_total_expert * down_expert_bytes;
         uint64_t gate_inner = 0;
         uint64_t up_inner = 0;
         uint64_t down_inner = 0;
@@ -14214,11 +14395,11 @@ int ds4_gpu_routed_moe_batch_tensor(
         }
 
         ds4_gpu_mul_mv_id_args gate_args =
-            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, 256,
+            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
                                           gate_row_bytes, gate_expert_bytes,
                                           1, n_expert, n_tokens, gate_nr0);
         ds4_gpu_mul_mv_id_args down_args =
-            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, 256,
+            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
         const bool use_mm_id = n_tokens >= 32u && ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
@@ -14251,13 +14432,13 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool request_mid_f16 = !g_quality_mode;
         if (use_mm_id) {
             gate_map_args =
-                ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, 256, 1, n_expert, n_tokens);
+                ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, n_total_expert, 1, n_expert, n_tokens);
             gate_mm_args =
-                ds4_gpu_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, 256,
+                ds4_gpu_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
                                               gate_row_bytes, gate_expert_bytes,
                                               1, n_expert, n_tokens);
             down_mm_args =
-                ds4_gpu_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, 256,
+                ds4_gpu_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, n_total_expert,
                                                         down_row_bytes, down_expert_bytes,
                                                         n_expert, n_expert, n_tokens,
                                                         request_mid_f16 ? sizeof(uint16_t) : sizeof(float));
